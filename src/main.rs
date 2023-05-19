@@ -4,46 +4,31 @@
 #![feature(asm_experimental_arch)]
 #![feature(asm_const)]
 
-// mod micros;
 mod millis;
 
 use embedded_hal::digital::v2::OutputPin;
-// use micros::Timepiece;
-use millis::{enable_interrupts, micros, millis, millis_init};
+use millis::{enable_interrupts, millis, millis_init, nanos};
 use sevensegment::SevenSeg;
 
 use panic_halt as _;
 
-// struct Timer {
-//     clock: Chronometer<Atmega, Timepiece>,
-// }
-
-// impl Timer {
-//     pub fn new(timer: arduino_hal::time::timers::Timer0) -> Self {
-//         let clock = Chronometer::new(Timepiece::new(timer));
-//         Self { clock }
-//     }
-
-//     pub fn micros(&self) -> u32 {
-//         self.clock.micros()
-//     }
-// }
-
 struct Display<P: OutputPin, const L: usize> {
     segment: SevenSeg<P, P, P, P, P, P, P>,
     select_pins: [P; L],
+    dot_pin: P,
 }
 
 impl<P: OutputPin, const L: usize> Display<P, L> {
-    fn new(data_pins: [P; 7], select_pins: [P; L]) -> Self {
+    fn new(data_pins: [P; 7], select_pins: [P; L], dot_pin: P) -> Self {
         let [a, b, c, d, e, f, g] = data_pins;
         Self {
             segment: SevenSeg::new(a, b, c, d, e, f, g),
             select_pins,
+            dot_pin,
         }
     }
 
-    fn display_number(&mut self, number: u16, delay: u16) {
+    fn display_number(&mut self, number: u16, delay: u16, dot_position: usize) {
         let mut number = number;
         for position in 0..L {
             let digit = number % 10;
@@ -54,14 +39,16 @@ impl<P: OutputPin, const L: usize> Display<P, L> {
                 } else {
                     99
                 },
+                position == dot_position,
             );
             number /= 10;
             arduino_hal::delay_ms(delay);
             self.segment.clear().unwrap();
+            let _ = self.dot_pin.set_low();
         }
     }
 
-    fn display_in_position(&mut self, position: usize, digit: u8) {
+    fn display_in_position(&mut self, position: usize, digit: u8, dot: bool) {
         for (index, pin) in self.select_pins.iter_mut().enumerate() {
             if index == position {
                 let _ = pin.set_low();
@@ -70,15 +57,16 @@ impl<P: OutputPin, const L: usize> Display<P, L> {
             }
         }
         let _ = self.select_pins[position].set_low();
+        let _ = self.dot_pin.set_state(dot.into());
         self.segment.display(digit).unwrap();
     }
 
     fn display_progress(&mut self) {
         for position in 0..L {
-            self.display_in_position(position, 99);
+            self.display_in_position(position, 99, false);
         }
 
-        self.display_in_position((millis() / 200u32) as usize % L, 99);
+        self.display_in_position((millis() / 200u32) as usize % L, 99, false);
         self.segment.seg_g(true).unwrap();
     }
 }
@@ -127,12 +115,12 @@ impl Detector {
         //  (value as u32) > self.latest_max() as u32 * (100 + self.threshold_percent) / 100
         {
             if self.current_burst_start < self.current_burst_end {
-                self.current_burst_start = micros();
+                self.current_burst_start = nanos();
             }
         }
         if (value as u32) <= avg {
             if self.current_burst_start > self.current_burst_end {
-                self.current_burst_end = micros();
+                self.current_burst_end = nanos();
             }
         }
     }
@@ -141,21 +129,13 @@ impl Detector {
         self.current_burst_start > self.current_burst_end
     }
 
-    fn get_last_burst_duration(&self) -> Option<u32> {
+    fn get_last_burst_duration_us(&self) -> Option<f32> {
         if self.current_burst_start < self.current_burst_end {
-            Some((self.current_burst_end - self.current_burst_start) as u32)
+            Some(((self.current_burst_end - self.current_burst_start) as f32) / 1000f32)
         } else {
             None
         }
     }
-
-    // fn get_last_burst_start_time(&self) -> Option<u32> {
-    //     if self.current_burst_start <= self.current_burst_end {
-    //         Some(self.current_burst_start)
-    //     } else {
-    //         None
-    //     }
-    // }
 }
 
 #[arduino_hal::entry]
@@ -180,13 +160,14 @@ fn main() -> ! {
             pins.d11.into_output().downgrade(),
             pins.d12.into_output().downgrade(),
         ],
+        pins.d13.into_output().downgrade(),
     );
 
     millis_init(dp.TC1);
     enable_interrupts();
 
     let input = pins.a0.into_analog_input(&mut adc);
-    let mut detector = Detector::new(2);
+    let mut detector = Detector::new(20);
 
     loop {
         let mut value = input.analog_read(&mut adc);
@@ -196,13 +177,17 @@ fn main() -> ! {
         detector.register_input(value);
 
         if !detector.is_in_active_burst() {
-            if let Some(duration) = detector.get_last_burst_duration() {
-                let ratio = 1000000f32 / duration as f32;
-                display.display_number(ratio as u16, 0);
+            if let Some(duration) = detector.get_last_burst_duration_us() {
+                if (millis() / 1000) % 2 == 0 {
+                    display.display_number((duration / 1000f32) as u16, 0, 0);
+                } else {
+                    let ratio = 1000000f32 / duration;
+                    display.display_number(ratio as u16, 0, 99);
+                }
             }
         } else {
             display.display_progress();
-            display.display_number(detector.filter.filter(value as f32) as u16, 1);
+            // display.display_number(detector.filter.filter(value as f32) as u16, 1);
         }
 
         // display.display_number((millis() / 1000) as u16, 1);
