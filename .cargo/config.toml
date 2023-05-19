@@ -1,0 +1,8 @@
+[build]
+target = "arduino-micro.json"
+
+[unstable]
+build-std = ["core", "alloc"]
+
+[target.'cfg(target_arch = "avr")']
+runner = "ravedude micro --open-console --baudrate 57600"
