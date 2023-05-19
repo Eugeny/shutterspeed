@@ -110,18 +110,11 @@ impl Detector {
     fn register_input(&mut self, value: u16) {
         let avg = self.filter.filter(value as f32) as u32;
 
-        if (value as u32) > avg * (100 + self.threshold_percent) / 100
-        //     &&
-        //  (value as u32) > self.latest_max() as u32 * (100 + self.threshold_percent) / 100
-        {
-            if self.current_burst_start < self.current_burst_end {
-                self.current_burst_start = nanos();
-            }
+        if (value as u32) > avg * (100 + self.threshold_percent) / 100 && self.current_burst_start < self.current_burst_end {
+            self.current_burst_start = nanos();
         }
-        if (value as u32) <= avg {
-            if self.current_burst_start > self.current_burst_end {
-                self.current_burst_end = nanos();
-            }
+        if (value as u32) <= avg && self.current_burst_start > self.current_burst_end {
+            self.current_burst_end = nanos();
         }
     }
 

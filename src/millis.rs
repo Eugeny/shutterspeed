@@ -66,7 +66,7 @@ pub fn nanos() -> u64 {
             .wrapping_mul(TIMER_TOP as u64)
             .wrapping_add(counter as u64)
     });
-    ticks.wrapping_mul(TICK_NS as u64)
+    ticks.wrapping_mul(TICK_NS)
 }
 
 pub fn micros() -> u64 {
