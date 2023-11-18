@@ -110,7 +110,9 @@ impl Detector {
     fn register_input(&mut self, value: u16) {
         let avg = self.filter.filter(value as f32) as u32;
 
-        if (value as u32) > avg * (100 + self.threshold_percent) / 100 && self.current_burst_start < self.current_burst_end {
+        if (value as u32) > avg * (100 + self.threshold_percent) / 100
+            && self.current_burst_start < self.current_burst_end
+        {
             self.current_burst_start = nanos();
         }
         if (value as u32) <= avg && self.current_burst_start > self.current_burst_end {
@@ -155,6 +157,12 @@ fn main() -> ! {
         ],
         pins.d13.into_output().downgrade(),
     );
+
+    // let mut x = 0;
+    // loop {
+    //     x += 1;
+    //     display.display_number(x, 1, 0);
+    // }
 
     millis_init(dp.TC1);
     enable_interrupts();
