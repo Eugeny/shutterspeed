@@ -6,8 +6,16 @@
 
 mod millis;
 
+use core::fmt::Write;
+use embedded_hal::blocking::delay::{DelayMs, DelayUs};
 use embedded_hal::digital::v2::OutputPin;
-use millis::{enable_interrupts, millis, millis_init, nanos};
+
+use heapless::String;
+use lcd1602_driver::builder::{Builder, BuilderAPI};
+use lcd1602_driver::enums::basic_command::{Font, LineMode, MoveDirection, ShiftType, State};
+use lcd1602_driver::pins::FourPinsAPI;
+use lcd1602_driver::{LCDBasic, LCDExt};
+use millis::{enable_interrupts, millis, millis_init, nanos, disable_interrupts};
 use sevensegment::SevenSeg;
 
 use panic_halt as _;
@@ -133,30 +141,70 @@ impl Detector {
     }
 }
 
+struct Delayer {}
+impl DelayMs<u32> for Delayer {
+    fn delay_ms(&mut self, ms: u32) {
+        arduino_hal::delay_ms(ms as u16);
+    }
+}
+impl DelayUs<u32> for Delayer {
+    fn delay_us(&mut self, us: u32) {
+        arduino_hal::delay_us(us);
+    }
+}
+
 #[arduino_hal::entry]
 fn main() -> ! {
     let dp = arduino_hal::Peripherals::take().unwrap();
     let pins = arduino_hal::pins!(dp);
+
     let mut adc = arduino_hal::Adc::new(dp.ADC, Default::default());
 
-    let mut display = Display::new(
-        [
-            pins.d2.into_output().downgrade(),
-            pins.d3.into_output().downgrade(),
-            pins.d4.into_output().downgrade(),
-            pins.d5.into_output().downgrade(),
-            pins.d6.into_output().downgrade(),
-            pins.d7.into_output().downgrade(),
-            pins.d8.into_output().downgrade(),
-        ],
-        [
-            pins.d9.into_output().downgrade(),
-            pins.d10.into_output().downgrade(),
-            pins.d11.into_output().downgrade(),
-            pins.d12.into_output().downgrade(),
-        ],
-        pins.d13.into_output().downgrade(),
-    );
+    // let mut display = Display::new(
+    //     [
+    //         pins.d2.into_output().downgrade(),
+    //         pins.d3.into_output().downgrade(),
+    //         pins.d4.into_output().downgrade(),
+    //         pins.d5.into_output().downgrade(),
+    //         pins.d6.into_output().downgrade(),
+    //         pins.d7.into_output().downgrade(),
+    //         pins.d8.into_output().downgrade(),
+    //     ],
+    //     [
+    //         pins.d9.into_output().downgrade(),
+    //         pins.d10.into_output().downgrade(),
+    //         pins.d11.into_output().downgrade(),
+    //         pins.d12.into_output().downgrade(),
+    //     ],
+    //     pins.d13.into_output().downgrade(),
+    // );
+
+    let rs_pin = pins.d3.into_output().downgrade();
+    let rw_pin = pins.d4.into_output().downgrade();
+    let en_pin = pins.d2.into_output().downgrade();
+
+    let db4_pin = pins.d9.into_opendrain().downgrade();
+    let db5_pin = pins.d10.into_opendrain().downgrade();
+    let db6_pin = pins.d11.into_opendrain().downgrade();
+    let db7_pin = pins.d12.into_opendrain().downgrade();
+
+    // put pins together
+    let lcd_pins =
+        lcd1602_driver::pins::Pins::new(rs_pin, rw_pin, en_pin, db4_pin, db5_pin, db6_pin, db7_pin);
+
+    // setup a builder
+    let lcd_builder = Builder::new(lcd_pins, Delayer {})
+        .set_blink(State::Off)
+        .set_cursor(State::Off)
+        .set_direction(MoveDirection::LeftToRight)
+        .set_display(State::On)
+        .set_font(Font::Font5x8)
+        .set_line(LineMode::TwoLine)
+        .set_shift(ShiftType::CursorOnly)
+        .set_wait_interval_us(10);
+
+    // init LCD1602
+    let mut lcd = lcd_builder.build_and_init();
 
     // let mut x = 0;
     // loop {
@@ -168,28 +216,47 @@ fn main() -> ! {
     enable_interrupts();
 
     let input = pins.a0.into_analog_input(&mut adc);
-    let mut detector = Detector::new(20);
+    // let mut detector = Detector::new(20);
 
+    let mut ctr = 0;
+    let mut max: u16 = 0;
     loop {
+        ctr += 1;
         let mut value = input.analog_read(&mut adc);
         if value < 5 {
             value = 0;
         }
-        detector.register_input(value);
+        max = max.max(value);
+        // detector.register_input(value);
 
-        if !detector.is_in_active_burst() {
-            if let Some(duration) = detector.get_last_burst_duration_us() {
-                if (millis() / 1000) % 2 == 0 {
-                    display.display_number((duration / 1000f32) as u16, 0, 0);
-                } else {
-                    let ratio = 1000000f32 / duration;
-                    display.display_number(ratio as u16, 0, 99);
-                }
-            }
-        } else {
-            display.display_progress();
-            // display.display_number(detector.filter.filter(value as f32) as u16, 1);
-        }
+
+        disable_interrupts();
+        lcd.set_cursor_pos((1, 0));
+        let mut s = String::<32>::new();
+        let _ = write!(s, "cur: {value:4}");
+        lcd.write_str_to_cur(&s);
+        lcd.write_str_to_cur(if ctr % 2 == 0 { "." } else { " " });
+        lcd.set_cursor_pos((1, 1));
+        s.clear();
+        let _ = write!(s, "max: {max:4}");
+        lcd.write_str_to_cur(&s);
+        enable_interrupts();
+
+        arduino_hal::delay_ms(100);
+
+        // if !detector.is_in_active_burst() {
+        //     if let Some(duration) = detector.get_last_burst_duration_us() {
+        //         if (millis() / 1000) % 2 == 0 {
+        //             // display.display_number((duration / 1000f32) as u16, 0, 0);
+        //         } else {
+        //             let ratio = 1000000f32 / duration;
+        //             // display.display_number(ratio as u16, 0, 99);
+        //         }
+        //     }
+        // } else {
+        //     // display.display_progress();
+        //     // display.display_number(detector.filter.filter(value as f32) as u16, 1);
+        // }
 
         // display.display_number((millis() / 1000) as u16, 1);
 

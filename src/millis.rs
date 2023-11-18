@@ -80,3 +80,7 @@ pub fn millis() -> u32 {
 pub fn enable_interrupts() {
     unsafe { avr_device::interrupt::enable() };
 }
+
+pub fn disable_interrupts() {
+    unsafe { avr_device::interrupt::disable() };
+}

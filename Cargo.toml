@@ -18,11 +18,18 @@ embedded-hal = "0.2.3"
 sevensegment = "0.2.0"
 avr-device = "0.5.1"
 panic-serial = { version = "0.1.2", features = ["full"] }
+lcd1602-rs = "0.1.0"
+lcd1602-driver = "0.1.0"
+heapless = "0.8.0"
 
 [dependencies.arduino-hal]
 git = "https://github.com/Eugeny/avr-hal.git"
 rev = "f205366"
 features = ["arduino-micro"]
+
+[dependencies.avr-hal-generic]
+git = "https://github.com/Eugeny/avr-hal.git"
+rev = "f205366"
 
 # Configure the build for minimal size - AVRs have very little program memory
 [profile.dev]
