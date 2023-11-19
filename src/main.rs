@@ -6,7 +6,6 @@
 
 mod millis;
 
-use core::fmt::Write;
 use core::ops::{Deref, DerefMut};
 use embedded_hal::blocking::delay::{DelayMs, DelayUs};
 
@@ -14,73 +13,11 @@ use heapless::String;
 use lcd1602_driver::builder::{Builder, BuilderAPI};
 use lcd1602_driver::enums::basic_command::{Font, LineMode, MoveDirection, ShiftType, State};
 use lcd1602_driver::pins::FourPinsAPI;
-use lcd1602_driver::{LCDBasic, LCDExt};
-use millis::{disable_interrupts, enable_interrupts, millis, millis_init, nanos};
+use lcd1602_driver::{LCDBasic, LCDExt, LCD};
+use millis::{disable_interrupts, enable_interrupts, millis_init, nanos};
 
 use panic_halt as _;
 use ufmt::{uWrite, uwrite};
-
-struct SignalFilter {
-    f: f32,
-    factor_millis: f32,
-}
-
-impl SignalFilter {
-    fn new(factor_millis: f32) -> Self {
-        Self {
-            f: 0f32,
-            factor_millis,
-        }
-    }
-
-    fn filter(&mut self, value: f32) -> f32 {
-        self.f += self.factor_millis * (value - self.f) / 1000f32;
-        self.f
-    }
-}
-
-struct Detector {
-    current_burst_start: u64,
-    current_burst_end: u64,
-    threshold_percent: u32,
-    filter: SignalFilter,
-}
-
-impl Detector {
-    fn new(threshold_percent: u32) -> Self {
-        Self {
-            current_burst_start: 0,
-            current_burst_end: 1,
-            threshold_percent,
-            filter: SignalFilter::new(1f32),
-        }
-    }
-
-    fn register_input(&mut self, value: u16) {
-        let avg = self.filter.filter(value as f32) as u32;
-
-        if (value as u32) > avg * (100 + self.threshold_percent) / 100
-            && self.current_burst_start < self.current_burst_end
-        {
-            self.current_burst_start = nanos();
-        }
-        if (value as u32) <= avg && self.current_burst_start > self.current_burst_end {
-            self.current_burst_end = nanos();
-        }
-    }
-
-    fn is_in_active_burst(&self) -> bool {
-        self.current_burst_start > self.current_burst_end
-    }
-
-    fn get_last_burst_duration_us(&self) -> Option<f32> {
-        if self.current_burst_start < self.current_burst_end {
-            Some(((self.current_burst_end - self.current_burst_start) as f32) / 1000f32)
-        } else {
-            None
-        }
-    }
-}
 
 struct Delayer {}
 impl DelayMs<u32> for Delayer {
@@ -171,7 +108,6 @@ fn main() -> ! {
         }
         false
     };
-    // let mut detector = Detector::new(20);
 
     'main: loop {
         disable_interrupts();
@@ -209,6 +145,11 @@ fn main() -> ! {
         let t_start: u64;
         let t_end;
 
+        let mut rise_buffer = [0; 40];
+        let mut rise_buffer_ptr = 0;
+        let mut fall_buffer = [0; 40];
+        let mut fall_buffer_ptr = 0;
+
         loop {
             let value = input.analog_read(&mut adc);
             if value > expected_high {
@@ -229,13 +170,33 @@ fn main() -> ! {
             sum += value as u64;
             max = max.max(value);
             sample_ctr += 1;
+
+            if rise_buffer_ptr < rise_buffer.len() {
+                rise_buffer[rise_buffer_ptr] = value;
+                rise_buffer_ptr += 1;
+            }
+
+            fall_buffer[fall_buffer_ptr] = value;
+            fall_buffer_ptr = (fall_buffer_ptr + 1) % fall_buffer.len();
+
             if reset_pin.is_low() {
                 continue 'main;
             }
         }
 
+        // Unwrap fall_buffer (ring buffer)
+        {
+            let mut fall_buffer_tmp = fall_buffer;
+            for i in 0..fall_buffer.len() {
+                fall_buffer_tmp[i] = fall_buffer[(fall_buffer_ptr + i) % fall_buffer.len()];
+            }
+            fall_buffer = fall_buffer_tmp;
+        }
+        // ---
+
         let integrated_min = avg as u64;
-        let integrated = (sum - integrated_min as u64 * sample_ctr as u64) as f32 / sample_ctr as f32;
+        let integrated =
+            (sum - integrated_min as u64 * sample_ctr as u64) as f32 / sample_ctr as f32;
         let integrated_max = max as u64 - integrated_min;
         let integrated_normalized = integrated / integrated_max as f32;
 
@@ -252,69 +213,90 @@ fn main() -> ! {
             let int = fraction as u32;
             let fr = (fraction - int as f32) * 10.0;
             s.clear();
-            let _ = uwrite!(s, "1/{}.{} | {}ms", int, fr as u32, duration / 1000000);
+            let _ = uwrite!(s, "1/{}.{}s  {}ms", int, fr as u32, duration / 1000000);
             lcd.write_str_to_cur(&s);
         }
         enable_interrupts();
 
         loop {
-            let mut show_info = |label, value| {
+            // let mut show_info = |label, value| {
+            //     disable_interrupts();
+            //     lcd.write_str_to_pos("                 ", (0, 1));
+            //     s.clear();
+            //     let _ = uwrite!(s, "{}: {}", label, value);
+            //     lcd.write_str_to_pos(&s, (0, 1));
+            //     enable_interrupts();
+            // };
+
+            // show_info("Int f", (integrated_normalized * 1000.0) as u32);
+
+            // if wait_reset(1000) {
+            //     break;
+            // }
+
+            // show_info("Max", max as u32);
+
+            // if wait_reset(1000) {
+            //     break;
+            // }
+
+            // show_info("Avg", avg as u32);
+
+            // if wait_reset(1000) {
+            //     break;
+            // }
+
+            // show_info("Samples", sample_ctr);
+
+            // if wait_reset(1000) {
+            //     break;
+            // }
+
+            const CHAR_WIDTH: usize = 5;
+            const CHAR_HEIGHT: usize = 8;
+            let mut display_graph =
+                |lcd: &mut LCD<_, _, 4, _>, data: &[u16], position: (u8, u8), cgram_offset: u8| {
+                    for i in 0..data.len() / CHAR_WIDTH {
+                        let mut graph = [0u8; CHAR_HEIGHT];
+                        for idx in 0..CHAR_WIDTH {
+                            let sample_index = i * CHAR_WIDTH + idx;
+                            let sample = data[sample_index];
+                            let normalized = (sample - expected_high) * CHAR_HEIGHT as u16
+                                / (max - expected_high);
+                            graph[(CHAR_HEIGHT
+                                - 1
+                                - (normalized as usize).min(CHAR_HEIGHT as usize - 1))
+                                as usize] |= 1 << (CHAR_WIDTH - 1 - idx);
+                        }
+                        lcd.write_graph_to_cgram(cgram_offset + i as u8, &graph);
+                        lcd.write_graph_to_pos(
+                            cgram_offset + i as u8,
+                            (position.0 + i as u8, position.1),
+                        );
+                    }
+                };
+
+            {
                 disable_interrupts();
-                lcd.write_str_to_pos("                 ", (0, 1));
-                s.clear();
-                let _ = uwrite!(s, "{}: {}", label, value);
-                lcd.write_str_to_pos(&s, (0, 1));
+                lcd.write_str_to_pos("Ramp up          ", (0, 1));
+                let rise_buffer = &rise_buffer[..rise_buffer_ptr];
+                display_graph(&mut lcd, rise_buffer, (8, 1), 0);
                 enable_interrupts();
-            };
 
-            show_info("Int f", (integrated_normalized * 1000.0) as u32);
-
-            if wait_reset(1000) {
-                break;
+                if wait_reset(1000) {
+                    break;
+                }
             }
+            {
+                disable_interrupts();
+                lcd.write_str_to_pos("Ramp dn          ", (0, 1));
+                display_graph(&mut lcd, &fall_buffer, (8, 1), 0);
+                enable_interrupts();
 
-            show_info("Max", max as u32);
-
-            if wait_reset(1000) {
-                break;
-            }
-
-            show_info("Avg", avg as u32);
-
-            if wait_reset(1000) {
-                break;
-            }
-
-            show_info("Samples", sample_ctr);
-
-            if wait_reset(1000) {
-                break;
+                if wait_reset(1000) {
+                    break;
+                }
             }
         }
     }
-
-    // {
-
-    // if !detector.is_in_active_burst() {
-    //     if let Some(duration) = detector.get_last_burst_duration_us() {
-    //         if (millis() / 1000) % 2 == 0 {
-    //             // display.display_number((duration / 1000f32) as u16, 0, 0);
-    //         } else {
-    //             let ratio = 1000000f32 / duration;
-    //             // display.display_number(ratio as u16, 0, 99);
-    //         }
-    //     }
-    // } else {
-    //     // display.display_progress();
-    //     // display.display_number(detector.filter.filter(value as f32) as u16, 1);
-    // }
-
-    // display.display_number((millis() / 1000) as u16, 1);
-
-    // let max = (value as u32 * 9999 / 2u32.pow(16)) as u16;
-    // let max = micros();
-    // display.display_number((max ) as u16, 1);
-    // }
-
-    loop {}
 }
