@@ -7,77 +7,18 @@
 mod millis;
 
 use core::fmt::Write;
+use core::ops::{Deref, DerefMut};
 use embedded_hal::blocking::delay::{DelayMs, DelayUs};
-use embedded_hal::digital::v2::OutputPin;
 
 use heapless::String;
 use lcd1602_driver::builder::{Builder, BuilderAPI};
 use lcd1602_driver::enums::basic_command::{Font, LineMode, MoveDirection, ShiftType, State};
 use lcd1602_driver::pins::FourPinsAPI;
 use lcd1602_driver::{LCDBasic, LCDExt};
-use millis::{enable_interrupts, millis, millis_init, nanos, disable_interrupts};
-use sevensegment::SevenSeg;
+use millis::{disable_interrupts, enable_interrupts, millis, millis_init, nanos};
 
 use panic_halt as _;
-
-struct Display<P: OutputPin, const L: usize> {
-    segment: SevenSeg<P, P, P, P, P, P, P>,
-    select_pins: [P; L],
-    dot_pin: P,
-}
-
-impl<P: OutputPin, const L: usize> Display<P, L> {
-    fn new(data_pins: [P; 7], select_pins: [P; L], dot_pin: P) -> Self {
-        let [a, b, c, d, e, f, g] = data_pins;
-        Self {
-            segment: SevenSeg::new(a, b, c, d, e, f, g),
-            select_pins,
-            dot_pin,
-        }
-    }
-
-    fn display_number(&mut self, number: u16, delay: u16, dot_position: usize) {
-        let mut number = number;
-        for position in 0..L {
-            let digit = number % 10;
-            self.display_in_position(
-                L - 1 - position,
-                if number > 0 || position == 0 {
-                    digit as u8
-                } else {
-                    99
-                },
-                position == dot_position,
-            );
-            number /= 10;
-            arduino_hal::delay_ms(delay);
-            self.segment.clear().unwrap();
-            let _ = self.dot_pin.set_low();
-        }
-    }
-
-    fn display_in_position(&mut self, position: usize, digit: u8, dot: bool) {
-        for (index, pin) in self.select_pins.iter_mut().enumerate() {
-            if index == position {
-                let _ = pin.set_low();
-            } else {
-                let _ = pin.set_high();
-            }
-        }
-        let _ = self.select_pins[position].set_low();
-        let _ = self.dot_pin.set_state(dot.into());
-        self.segment.display(digit).unwrap();
-    }
-
-    fn display_progress(&mut self) {
-        for position in 0..L {
-            self.display_in_position(position, 99, false);
-        }
-
-        self.display_in_position((millis() / 200u32) as usize % L, 99, false);
-        self.segment.seg_g(true).unwrap();
-    }
-}
+use ufmt::{uWrite, uwrite};
 
 struct SignalFilter {
     f: f32,
@@ -153,31 +94,40 @@ impl DelayUs<u32> for Delayer {
     }
 }
 
+struct EString<const L: usize>(String<L>);
+
+impl<const L: usize> Deref for EString<L> {
+    type Target = String<L>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<const L: usize> DerefMut for EString<L> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl<const L: usize> uWrite for EString<L> {
+    type Error = core::fmt::Error;
+
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        self.0.push_str(s).map_err(|_| core::fmt::Error)
+    }
+
+    fn write_char(&mut self, c: char) -> Result<(), Self::Error> {
+        self.0.push(c).map_err(|_| core::fmt::Error)
+    }
+}
+
 #[arduino_hal::entry]
 fn main() -> ! {
     let dp = arduino_hal::Peripherals::take().unwrap();
     let pins = arduino_hal::pins!(dp);
 
     let mut adc = arduino_hal::Adc::new(dp.ADC, Default::default());
-
-    // let mut display = Display::new(
-    //     [
-    //         pins.d2.into_output().downgrade(),
-    //         pins.d3.into_output().downgrade(),
-    //         pins.d4.into_output().downgrade(),
-    //         pins.d5.into_output().downgrade(),
-    //         pins.d6.into_output().downgrade(),
-    //         pins.d7.into_output().downgrade(),
-    //         pins.d8.into_output().downgrade(),
-    //     ],
-    //     [
-    //         pins.d9.into_output().downgrade(),
-    //         pins.d10.into_output().downgrade(),
-    //         pins.d11.into_output().downgrade(),
-    //         pins.d12.into_output().downgrade(),
-    //     ],
-    //     pins.d13.into_output().downgrade(),
-    // );
 
     let rs_pin = pins.d3.into_output().downgrade();
     let rw_pin = pins.d4.into_output().downgrade();
@@ -203,65 +153,168 @@ fn main() -> ! {
         .set_shift(ShiftType::CursorOnly)
         .set_wait_interval_us(10);
 
-    // init LCD1602
     let mut lcd = lcd_builder.build_and_init();
 
-    // let mut x = 0;
-    // loop {
-    //     x += 1;
-    //     display.display_number(x, 1, 0);
-    // }
+    let mut s = EString(String::<32>::new());
 
     millis_init(dp.TC1);
     enable_interrupts();
 
     let input = pins.a0.into_analog_input(&mut adc);
+    let reset_pin = pins.a5.into_pull_up_input();
+    let mut wait_reset = |ms| {
+        for _ in 0..ms {
+            if reset_pin.is_low() {
+                return true;
+            }
+            arduino_hal::delay_ms(1);
+        }
+        false
+    };
     // let mut detector = Detector::new(20);
 
-    let mut ctr = 0;
-    let mut max: u16 = 0;
-    loop {
-        ctr += 1;
-        let mut value = input.analog_read(&mut adc);
-        if value < 5 {
-            value = 0;
-        }
-        max = max.max(value);
-        // detector.register_input(value);
+    'main: loop {
+        disable_interrupts();
+        lcd.clean_display();
+        lcd.set_cursor_pos((1, 0));
+        lcd.write_str_to_cur("Calibrating");
+        lcd.set_cursor_blink_state(State::On);
+        enable_interrupts();
 
+        let mut avg = 0.0;
+        let calibration_loops = 1000;
+        for _ in 0..calibration_loops {
+            let value = input.analog_read(&mut adc);
+            avg += value as f32 / calibration_loops as f32;
+            arduino_hal::delay_ms(1);
+        }
+
+        let threshold = 1.5;
+        let expected_high = (avg * threshold).min(1022.0) as u16;
 
         disable_interrupts();
+        lcd.clean_display();
         lcd.set_cursor_pos((1, 0));
-        let mut s = String::<32>::new();
-        let _ = write!(s, "cur: {value:4}");
-        lcd.write_str_to_cur(&s);
-        lcd.write_str_to_cur(if ctr % 2 == 0 { "." } else { " " });
+        lcd.write_str_to_cur("* Measuring *");
+        lcd.set_cursor_blink_state(State::On);
         lcd.set_cursor_pos((1, 1));
         s.clear();
-        let _ = write!(s, "max: {max:4}");
+        let _ = uwrite!(s, "A: {} T: {}", avg as u32, expected_high);
         lcd.write_str_to_cur(&s);
         enable_interrupts();
 
-        arduino_hal::delay_ms(100);
+        let mut max: u16 = 0;
+        let mut sample_ctr = 0;
+        let mut sum: u64 = 0;
+        let t_start: u64;
+        let t_end;
 
-        // if !detector.is_in_active_burst() {
-        //     if let Some(duration) = detector.get_last_burst_duration_us() {
-        //         if (millis() / 1000) % 2 == 0 {
-        //             // display.display_number((duration / 1000f32) as u16, 0, 0);
-        //         } else {
-        //             let ratio = 1000000f32 / duration;
-        //             // display.display_number(ratio as u16, 0, 99);
-        //         }
-        //     }
-        // } else {
-        //     // display.display_progress();
-        //     // display.display_number(detector.filter.filter(value as f32) as u16, 1);
-        // }
+        loop {
+            let value = input.analog_read(&mut adc);
+            if value > expected_high {
+                t_start = nanos();
+                break;
+            }
+            if reset_pin.is_low() {
+                continue 'main;
+            }
+        }
 
-        // display.display_number((millis() / 1000) as u16, 1);
+        loop {
+            let value = input.analog_read(&mut adc);
+            if value < expected_high {
+                t_end = nanos();
+                break;
+            }
+            sum += value as u64;
+            max = max.max(value);
+            sample_ctr += 1;
+            if reset_pin.is_low() {
+                continue 'main;
+            }
+        }
 
-        // let max = (value as u32 * 9999 / 2u32.pow(16)) as u16;
-        // let max = micros();
-        // display.display_number((max ) as u16, 1);
+        let integrated_min = avg as u64;
+        let integrated = (sum - integrated_min as u64 * sample_ctr as u64) as f32 / sample_ctr as f32;
+        let integrated_max = max as u64 - integrated_min;
+        let integrated_normalized = integrated / integrated_max as f32;
+
+        let duration_raw = t_end - t_start;
+        let duration = (duration_raw as f32 * integrated_normalized) as u64;
+
+        disable_interrupts();
+        lcd.clean_display();
+        lcd.set_cursor_blink_state(State::Off);
+        lcd.set_cursor_pos((0, 0));
+
+        {
+            let fraction = 1000000000.0 / duration as f32;
+            let int = fraction as u32;
+            let fr = (fraction - int as f32) * 10.0;
+            s.clear();
+            let _ = uwrite!(s, "1/{}.{} | {}ms", int, fr as u32, duration / 1000000);
+            lcd.write_str_to_cur(&s);
+        }
+        enable_interrupts();
+
+        loop {
+            let mut show_info = |label, value| {
+                disable_interrupts();
+                lcd.write_str_to_pos("                 ", (0, 1));
+                s.clear();
+                let _ = uwrite!(s, "{}: {}", label, value);
+                lcd.write_str_to_pos(&s, (0, 1));
+                enable_interrupts();
+            };
+
+            show_info("Int f", (integrated_normalized * 1000.0) as u32);
+
+            if wait_reset(1000) {
+                break;
+            }
+
+            show_info("Max", max as u32);
+
+            if wait_reset(1000) {
+                break;
+            }
+
+            show_info("Avg", avg as u32);
+
+            if wait_reset(1000) {
+                break;
+            }
+
+            show_info("Samples", sample_ctr);
+
+            if wait_reset(1000) {
+                break;
+            }
+        }
     }
+
+    // {
+
+    // if !detector.is_in_active_burst() {
+    //     if let Some(duration) = detector.get_last_burst_duration_us() {
+    //         if (millis() / 1000) % 2 == 0 {
+    //             // display.display_number((duration / 1000f32) as u16, 0, 0);
+    //         } else {
+    //             let ratio = 1000000f32 / duration;
+    //             // display.display_number(ratio as u16, 0, 99);
+    //         }
+    //     }
+    // } else {
+    //     // display.display_progress();
+    //     // display.display_number(detector.filter.filter(value as f32) as u16, 1);
+    // }
+
+    // display.display_number((millis() / 1000) as u16, 1);
+
+    // let max = (value as u32 * 9999 / 2u32.pow(16)) as u16;
+    // let max = micros();
+    // display.display_number((max ) as u16, 1);
+    // }
+
+    loop {}
 }
